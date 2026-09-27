@@ -45,7 +45,7 @@ jobs:
           failures=0; cached_source_ipa_url='' 
           while (( processed < 32 )); do
             rm -f claim.json p12.b64 p12.password mobileprovision.b64 signed.ipa
-            if ! status="$(curl --silent --show-error --output claim.json --write-out '%{http_code}' --retry 3 --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" "${SIGNING_SERVICE_URL}/api/signing/claim")"; then
+            if ! status="$(curl --silent --show-error --output claim.json --write-out '%{http_code}' --retry 3 --header "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" "${SIGNING_SERVICE_URL}/api/signing/claim")"; then
               echo 'Unable to contact signing queue' >&2
               exit 1
             fi
