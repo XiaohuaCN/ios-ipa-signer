@@ -1,0 +1,88 @@
+name: Sign IPA
+on:
+  workflow_dispatch:
+    inputs:
+      certificate_id:
+        description: 'Certificate set ID, e.g. A (uses CERT_A_* secrets)'
+        required: true
+        default: A
+        type: string
+      source_id:
+        description: 'Source ID: uses IPA_URL_ID secret, or source-ID Release/source.ipa'
+        required: true
+        default: DEMO
+        type: string
+      ipa_sha256:
+        description: 'Expected SHA-256 of the original IPA (64 hex characters)'
+        required: true
+        type: string
+      job_id:
+        description: 'Optional external job ID for future Cloudflare integration'
+        type: string
+      app_id:
+        description: 'Optional external app record ID (does not change Bundle ID)'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipa-${{ inputs.certificate_id }}-${{ inputs.source_id }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download private Release source when no URL secret is configured
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ID: ${{ inputs.source_id }}
+          IPA_SOURCE_URL: ${{ secrets[format('IPA_URL_{0}', inputs.source_id)] }}
+        shell: bash
+        run: |
+          [[ "$SOURCE_ID" =~ ^[A-Za-z0-9_]{1,40}$ ]] || exit 1
+          if [[ -z "$IPA_SOURCE_URL" ]]; then
+            mkdir -p "$RUNNER_TEMP/ipa-input"
+            gh release download "source-${SOURCE_ID}" --repo "$GITHUB_REPOSITORY" --pattern source.ipa --dir "$RUNNER_TEMP/ipa-input"
+          fi
+      - name: Validate, sign and package
+        env:
+          CERTIFICATE_ID: ${{ inputs.certificate_id }}
+          SOURCE_ID: ${{ inputs.source_id }}
+          IPA_SHA256: ${{ inputs.ipa_sha256 }}
+          JOB_ID: ${{ inputs.job_id }}
+          APP_ID: ${{ inputs.app_id }}
+          P12_BASE64: ${{ secrets[format('CERT_{0}_P12_BASE64', inputs.certificate_id)] }}
+          P12_PASSWORD: ${{ secrets[format('CERT_{0}_P12_PASSWORD', inputs.certificate_id)] }}
+          PROFILE_BASE64: ${{ secrets[format('CERT_{0}_PROFILE_BASE64', inputs.certificate_id)] }}
+          EXTRA_PROFILES_JSON: ${{ secrets[format('CERT_{0}_EXTRA_PROFILES_JSON', inputs.certificate_id)] }}
+          IPA_SOURCE_URL: ${{ secrets[format('IPA_URL_{0}', inputs.source_id)] }}
+        run: python3 sign_ipa.py
+      # Future trusted publication step goes here: upload dist/signed.ipa to OSS,
+      # then send dist/metadata.json plus storage_url to a fixed Cloudflare endpoint.
+      # See README. No external publication is enabled in this first version.
+      - name: Store signed IPA and metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/signed.ipa
+            dist/metadata.json
+            dist/signed.ipa.sha256
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Always remove temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/ipa-signing/signing.keychain-db" >/dev/null 2>&1 || true
+          rm -rf "$RUNNER_TEMP/ipa-signing"
+          rm -rf "$RUNNER_TEMP/ipa-input"
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/ipa-signer-${GITHUB_RUN_ID}-"*.mobileprovision

@@ -1,0 +1,13 @@
+*.[pP]12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.pem
+*.key
+*.ipa
+*.keychain*
+.env*
+secrets/
+dist/
+__pycache__/
+*.pyc
