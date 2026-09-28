@@ -49,16 +49,30 @@ BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw -o - "$WORK/input-Info.plist
 # entitlements, while app/extension bundles receive the provisioning profile.
 # LCSign's working output contains SHA-1 and SHA-256 CodeDirectories. Current
 # zsign defaults to SHA-256 only, so explicitly request its dual-hash mode.
-zsign \
-  -f \
-  --legacy_sha1 \
-  -z 9 \
-  -b "$BUNDLE_ID" \
-  -k "$WORK/cert.p12" \
-  -p "$IOS_P12_PASSWORD" \
-  -m "$WORK/profile.mobileprovision" \
-  -o "$OUTPUT_IPA" \
-  "$INPUT_IPA"
+#
+# Passing -b rewrites the root Info.plist as XML even when the ID is unchanged.
+# For ordinary ASCII bundle IDs, omit it so a binary Info.plist stays in its
+# original format, matching LCSign's usual re-signing behaviour. Non-ASCII
+# IDs need -b because zsign otherwise mishandles UTF-16 surrogate pairs
+# (notably emoji) while building the CodeDirectory.
+ZSIGN_ARGS=(
+  -f
+  --legacy_sha1
+  -z 9
+  -k "$WORK/cert.p12"
+  -p "$IOS_P12_PASSWORD"
+  -m "$WORK/profile.mobileprovision"
+  -o "$OUTPUT_IPA"
+)
+
+if LC_ALL=C printf '%s' "$BUNDLE_ID" | LC_ALL=C grep -q '[^[:print:]]'; then
+  echo 'Using explicit bundle ID for non-ASCII Bundle ID compatibility'
+  ZSIGN_ARGS+=( -b "$BUNDLE_ID" )
+else
+  echo 'Preserving original root Info.plist format'
+fi
+
+zsign "${ZSIGN_ARGS[@]}" "$INPUT_IPA"
 
 [ -s "$OUTPUT_IPA" ] || {
   echo 'zsign did not create a signed IPA' >&2
