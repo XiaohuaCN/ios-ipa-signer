@@ -5,8 +5,7 @@ INPUT_IPA="${1:?usage: sign-ipa.sh input.ipa [output.ipa]}"
 OUTPUT_IPA="${2:-signed.ipa}"
 : "${IOS_P12_BASE64:?Missing IOS_P12_BASE64 secret}"
 : "${IOS_P12_PASSWORD:?Missing IOS_P12_PASSWORD secret}"
-: "${IOS_MOBILEPROVISION_BASE64 secret}"
-
+: "${IOS_MOBILEPROVISION_BASE64:?Missing IOS_MOBILEPROVISION_BASE64 secret}"
 command -v zsign >/dev/null 2>&1 || {
   echo 'zsign is required to sign LCSign-modified IPA files' >&2
   exit 1
