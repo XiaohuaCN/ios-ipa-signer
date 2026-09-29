@@ -5,7 +5,7 @@ INPUT_IPA="${1:?usage: sign-ipa.sh input.ipa [output.ipa]}"
 OUTPUT_IPA="${2:-signed.ipa}"
 : "${IOS_P12_BASE64:?Missing IOS_P12_BASE64 secret}"
 : "${IOS_P12_PASSWORD:?Missing IOS_P12_PASSWORD secret}"
-: "${IOS_MOBILEPROVISION_BASE64:?Missing IOS_MOBILEPROVISION_BASE64 secret}"
+: "${IOS_MOBILEPROVISION_BASE64 secret}"
 
 command -v zsign >/dev/null 2>&1 || {
   echo 'zsign is required to sign LCSign-modified IPA files' >&2
@@ -50,15 +50,16 @@ BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw -o - "$WORK/input-Info.plist
 # LCSign's working output contains SHA-1 and SHA-256 CodeDirectories. Current
 # zsign defaults to SHA-256 only, so explicitly request its dual-hash mode.
 #
-# Passing -b rewrites the root Info.plist as XML even when the ID is unchanged.
-# For ordinary ASCII bundle IDs, omit it so a binary Info.plist stays in its
-# original format, matching LCSign's usual re-signing behaviour. Non-ASCII
-# IDs need -b because zsign otherwise mishandles UTF-16 surrogate pairs
-# (notably emoji) while building the CodeDirectory.
+# Enable iOS Files integration. zsign intentionally rewrites Info.plist while
+# applying this setting; both binary and XML plist formats are valid to iOS.
+# Passing -b is still avoided for ordinary bundle IDs because it is unnecessary.
+# Non-ASCII IDs need -b because zsign otherwise mishandles UTF-16 surrogate
+# pairs (notably emoji) while building the CodeDirectory.
 ZSIGN_ARGS=(
   -f
   --legacy_sha1
   -z 9
+  -S
   -k "$WORK/cert.p12"
   -p "$IOS_P12_PASSWORD"
   -m "$WORK/profile.mobileprovision"
@@ -69,7 +70,7 @@ if LC_ALL=C printf '%s' "$BUNDLE_ID" | LC_ALL=C grep -q '[^[:print:]]'; then
   echo 'Using explicit bundle ID for non-ASCII Bundle ID compatibility'
   ZSIGN_ARGS+=( -b "$BUNDLE_ID" )
 else
-  echo 'Preserving original root Info.plist format'
+  echo 'Enabled Files app access (document browser and file sharing)'
 fi
 
 zsign "${ZSIGN_ARGS[@]}" "$INPUT_IPA"
