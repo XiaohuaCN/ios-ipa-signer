@@ -1,0 +1,145 @@
+name: Sign IPA Queue
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2-59/5 * * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ipa-signing-queue
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      SIGNING_SERVICE_URL: ${{ secrets.SIGNING_SERVICE_URL }}
+      SIGNING_SERVICE_TOKEN: ${{ secrets.SIGNING_SERVICE_TOKEN }}
+      SOURCE_STORAGE_HOST: ${{ secrets.SOURCE_STORAGE_HOST }}
+      SOURCE_ACCELERATED_HOST: ${{ secrets.SOURCE_ACCELERATED_HOST }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check signing queue
+        id: pending
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SIGNING_SERVICE_URL:?Missing SIGNING_SERVICE_URL repository secret}"
+          : "${SIGNING_SERVICE_TOKEN:?Missing SIGNING_SERVICE_TOKEN repository secret}"
+          response="$(curl --fail --silent --show-error --retry 3 --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" "${SIGNING_SERVICE_URL}/api/signing/pending")"
+          if jq -e '.has_jobs == true' >/dev/null <<< "$response"; then
+            echo 'has_jobs=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has_jobs=false' >> "$GITHUB_OUTPUT"
+            echo 'Signing queue is empty'
+          fi
+
+      - name: Build pinned LCSign-compatible signer
+        if: steps.pending.outputs.has_jobs == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install pkg-config openssl@3
+          git clone --quiet --filter=blob:none https://github.com/zhlynn/zsign.git "$RUNNER_TEMP/zsign"
+          git -C "$RUNNER_TEMP/zsign" checkout --quiet 614caa8d1ca949e260e5746144aa52d27a4b08d6
+          make -C "$RUNNER_TEMP/zsign/build/macos" -j2
+          echo "$RUNNER_TEMP/zsign/bin" >> "$GITHUB_PATH"
+
+      - name: Verify download and upload transport
+        if: steps.pending.outputs.has_jobs == 'true'
+        run: node --test scripts/download-source-ipa.test.mjs scripts/upload-signed-ipa.test.mjs scripts/signing-privacy.test.mjs
+
+      - name: Drain signing queue
+        if: steps.pending.outputs.has_jobs == 'true'
+        shell: bash
+        run: |
+          set -uo pipefail
+          umask 077
+          cleanup_materials() { rm -f claim.json p12.b64 p12.password mobileprovision.b64 signed.ipa input.ipa; }
+          trap cleanup_materials EXIT
+          : "${SIGNING_SERVICE_TOKEN:?Missing SIGNING_SERVICE_TOKEN repository secret}"
+
+          processed=0
+          failures=0
+          cached_source_ipa_url=''
+          while (( processed < 32 )); do
+            rm -f claim.json p12.b64 p12.password mobileprovision.b64 signed.ipa
+            if ! status="$(curl --silent --show-error --output claim.json --write-out '%{http_code}' --retry 3 --header "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" "${SIGNING_SERVICE_URL}/api/signing/claim")"; then
+              echo 'Unable to contact signing queue' >&2
+              exit 1
+            fi
+            if [ "$status" = "204" ]; then
+              break
+            fi
+            if [ "$status" != "200" ]; then
+              echo "Signing service returned HTTP $status" >&2
+              exit 1
+            fi
+
+            node scripts/prepare-signing-claim.mjs claim.json || exit 1
+            job_id="$(jq -r .job_id claim.json)" || exit 1
+            claim_token="$(jq -r .claim_token claim.json)" || exit 1
+
+            sign_one() {
+              source_ipa_url="$(jq -r .source_ipa_url claim.json)" || return
+              download_url="$source_ipa_url"
+              if [[ -n "${SOURCE_STORAGE_HOST:-}" && -n "${SOURCE_ACCELERATED_HOST:-}" && "$source_ipa_url" == "https://${SOURCE_STORAGE_HOST}/"* ]]; then
+                source_path="${source_ipa_url#https://${SOURCE_STORAGE_HOST}/}"
+                download_url="https://${SOURCE_ACCELERATED_HOST}/${source_path}"
+                echo 'Downloading source IPA through configured transfer acceleration'
+              fi
+              if [[ "$source_ipa_url" != "$cached_source_ipa_url" || ! -s input.ipa ]]; then SOURCE_IPA_URL="$download_url" SOURCE_IPA_SIZE="$(jq -r '(.source_size_bytes // 0)' claim.json)" node scripts/download-source-ipa.mjs input.ipa || return; cached_source_ipa_url="$source_ipa_url"; else echo 'Reusing the source IPA already downloaded for this batch'; fi
+              IOS_P12_BASE64="$(<p12.b64)" \
+              IOS_P12_PASSWORD="$(<p12.password)" \
+              IOS_MOBILEPROVISION_BASE64="$(<mobileprovision.b64)" \
+              node scripts/run-signing-private.mjs input.ipa signed.ipa || return
+              signed_ipa_url="$(SIGNED_UPLOAD_JOB_ID="$job_id" SIGNED_UPLOAD_CLAIM_TOKEN="$claim_token" node scripts/upload-signed-ipa.mjs signed.ipa)" || return
+              size_bytes="$(stat -f%z signed.ipa)" || return
+              curl --fail --show-error --output /dev/null --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" \
+                --header 'Content-Type: application/json' --request POST \
+                --data "$(jq -n --arg job_id "$job_id" --arg claim_token "$claim_token" --arg signed_ipa_url "$signed_ipa_url" --argjson size_bytes "$size_bytes" '{job_id:$job_id,claim_token:$claim_token,signed_ipa_url:$signed_ipa_url,size_bytes:$size_bytes}')" \
+                "${SIGNING_SERVICE_URL}/api/signing/complete" || return
+            }
+
+            if sign_one; then
+              echo "Completed signing job $job_id"
+            else
+              exit_code=$?
+              failures=$((failures + 1))
+              curl --silent --show-error --fail --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" \
+                --header 'Content-Type: application/json' --request POST \
+                --data "$(jq -n --arg job_id "$job_id" --arg claim_token "$claim_token" --arg error_message "GitHub Actions 签名步骤失败（exit ${exit_code}）" '{job_id:$job_id,claim_token:$claim_token,error_message:$error_message}')" \
+                "${SIGNING_SERVICE_URL}/api/signing/fail" >/dev/null || true
+              echo "Signing job $job_id failed; continuing with the queue" >&2
+            fi
+            processed=$((processed + 1))
+          done
+
+          rm -f claim.json p12.b64 p12.password mobileprovision.b64 signed.ipa
+          echo "Processed $processed signing job(s); failures: $failures"
+          if (( failures > 0 )); then
+            exit 1
+          fi
+
+      - name: Schedule external run cleanup
+        if: ${{ always() }}
+        run: |
+          set +e
+          curl --silent --show-error --fail --output /dev/null \
+            --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" \
+            --header 'Content-Type: application/json' --request POST \
+            --data "$(jq -n --arg github_run_id "$GITHUB_RUN_ID" '{github_run_id:$github_run_id}')" \
+            "${SIGNING_SERVICE_URL}/api/signing/run-finished"
+          exit 0
+
+      - name: Always remove task files
+        if: ${{ always() }}
+        run: rm -f claim.json p12.b64 p12.password mobileprovision.b64 signed.ipa input.ipa
