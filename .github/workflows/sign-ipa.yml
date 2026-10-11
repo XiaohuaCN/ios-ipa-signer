@@ -70,7 +70,12 @@ jobs:
           processed=0
           failures=0
           cached_source_ipa_url=''
+          queue_started=$SECONDS
           while (( processed < 32 )); do
+            if (( SECONDS - queue_started >= 55 * 60 )); then
+              echo 'Run budget reached; remaining jobs stay queued for the next run'
+              break
+            fi
             rm -f claim.json p12.b64 p12.password mobileprovision.b64 signed.ipa
             if ! status="$(curl --silent --show-error --output claim.json --write-out '%{http_code}' --retry 3 --header "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" --header "Authorization: Bearer ${SIGNING_SERVICE_TOKEN}" "${SIGNING_SERVICE_URL}/api/signing/claim")"; then
               echo 'Unable to contact signing queue' >&2
