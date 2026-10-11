@@ -105,14 +105,7 @@ function secureUrl(value) {
   if (url.protocol !== 'https:' || url.username || url.password || url.hash) throw protocolError();
   return url.href;
 }
-function secureProviderUrl(value) {
-  const target = secureUrl(value);
-  const host = new URL(target).hostname.toLowerCase();
-  if (!host.endsWith('.aliyundrive.net') && !host.endsWith('.aliyunpds.com')) throw protocolError();
-  return target;
-}
-
-export async function uploadParts({ session, size, readPart, transport, servicePost, log = console.error, sleep }) {
+export async function uploadParts({ session, size, readPart, transport, servicePost, log = console.error, sleep, now = Date.now, budgetMs = 30 * 60 * 1000 }) {
   const chunkSize = Number(session.chunk_size), total = Number(session.total_chunks);
   if (!Number.isSafeInteger(size) || size <= 0 || !Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > 64 * 1024 * 1024 || total !== Math.ceil(size / chunkSize)) throw protocolError();
   const relayUrl = secureUrl(session.direct_upload_url);
@@ -122,62 +115,34 @@ export async function uploadParts({ session, size, readPart, transport, serviceP
   const token = mask(session.direct_upload_token, log);
   let resume = mask(session.direct_resume_token, log);
   let uploaded = 0;
-  const started = Date.now();
-  log(`Upload route: direct provider first; ${total} parts; 180s per-part deadline`);
-  const partControl = secureUrl(session.direct_part_urls_url), ackControl = secureUrl(session.direct_ack_url);
-  mask(partControl, log); mask(ackControl, log);
-  if (new URL(partControl).origin !== new URL(relayUrl).origin || new URL(ackControl).origin !== new URL(relayUrl).origin) throw protocolError();
+  const started = now();
+  const remaining = () => {
+    const milliseconds = budgetMs - (now() - started);
+    if (milliseconds <= 0) throw Object.assign(new Error('Upload deadline exceeded'), { code: 'EUPLOADDEADLINE', retryable: false });
+    return milliseconds;
+  };
+  log(`Upload route: Cloudflare OpenList relay; ${total} parts; 180s per-part deadline`);
   for (let index = 0; index < total; index++) {
-    const partStart = Date.now();
+    remaining();
+    const partStart = now();
     const expected = Math.min(chunkSize, size - index * chunkSize);
     const bytes = await readPart(index * chunkSize, expected);
     if (!Buffer.isBuffer(bytes) || bytes.length !== expected) throw protocolError();
-    let remote, route = 'direct', providerAccepted = false;
     const remoteHeaders = () => ({ authorization: token, 'x-upload-id': remoteId, 'x-upload-session': resume });
-    try {
-      await withRetry(async () => {
-        const urls = jsonResponse(await transport.request(partControl, {
-          headers: { ...remoteHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ indices: [index] }),
-        }), true);
-        if (urls.resume_token) resume = mask(urls.resume_token, log);
-        const signedUrl = secureProviderUrl(urls.parts?.find(part => part.index === index)?.upload_url);
-        mask(signedUrl, log);
-        // Do not add Content-Type: it changes the provider's signed PUT request.
-        const uploadedPart = await transport.request(signedUrl, {
-          method: 'PUT', body: bytes, deadlineMs: 180000, idleTimeoutMs: 90000,
-        });
-        if (uploadedPart.status !== 200) throw Object.assign(new Error('Provider rejected part'), {
-          code: 'HTTP_' + uploadedPart.status,
-          retryable: uploadedPart.status === 403 || uploadedPart.status === 408 || uploadedPart.status === 429 || uploadedPart.status >= 500,
-        });
-      }, { log, sleep });
-      providerAccepted = true;
-      // Retry acknowledgement without retransmitting bytes if the control
-      // request stalls after the provider accepted the part.
-      remote = await withRetry(async () => jsonResponse(await transport.request(ackControl, {
-        headers: { ...remoteHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ indices: [index] }),
-      }), true), { log, sleep });
-    } catch (error) {
-      // A failed acknowledgement is ambiguous: the provider may already
-      // have accepted the bytes. Let the job retry instead of relaying twice.
-      if (providerAccepted) throw error;
-      if (error.retryable === false || ['EENDPOINT', 'EPROTOCOL'].includes(safeCode(error))) throw error;
-      log('Direct provider route unavailable; trying OpenList relay for this part');
-      remote = await withRetry(async () => jsonResponse(await transport.request(relayUrl, {
+    const remote = await withRetry(async () => jsonResponse(await transport.request(relayUrl, {
         method: 'PUT', headers: { ...remoteHeaders(), 'x-chunk-index': String(index), 'content-type': 'application/octet-stream' }, body: bytes,
-        deadlineMs: 180000, idleTimeoutMs: 60000,
+        deadlineMs: Math.min(180000, remaining()), idleTimeoutMs: 120000,
       }), true), { log, sleep });
-      route = 'relay';
-    }
     resume = mask(remote.resume_token, log);
     uploaded += expected;
-    const seconds = (Date.now() - started) / 1000;
-    log(`Uploaded signed IPA part ${index + 1}/${total} (${route}) in ${((Date.now() - partStart) / 1000).toFixed(2)}s; ${(uploaded / 1048576).toFixed(1)} MiB; avg ${(uploaded / 1048576 / Math.max(seconds, 0.001)).toFixed(2)} MiB/s`);
+    const seconds = (now() - started) / 1000;
+    log(`Uploaded signed IPA part ${index + 1}/${total} (relay) in ${((now() - partStart) / 1000).toFixed(2)}s; ${(uploaded / 1048576).toFixed(1)} MiB; avg ${(uploaded / 1048576 / Math.max(seconds, 0.001)).toFixed(2)} MiB/s`);
   }
+  remaining();
   const complete = await servicePost('/api/signing/multipart/complete', { upload_id: session.upload_id }, { 'x-openlist-upload-session': resume });
   const result = secureUrl(complete.signed_ipa_url);
   mask(result, log);
-  const seconds = (Date.now() - started) / 1000;
+  const seconds = (now() - started) / 1000;
   log(`Upload complete: ${(size / 1048576).toFixed(2)} MiB in ${seconds.toFixed(2)}s; pooled requests=${transport.stats.requests}, reused=${transport.stats.reused}`);
   return result;
 }

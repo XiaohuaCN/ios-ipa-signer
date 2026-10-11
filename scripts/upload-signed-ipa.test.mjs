@@ -1,41 +1,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createTransport, uploadParts, withRetry } from './upload-signed-ipa.mjs';
+import { createTransport, uploadParts } from './upload-signed-ipa.mjs';
 
 const session = {
   upload_id: 'local-session', chunk_size: 8, total_chunks: 3,
   direct_upload_url: 'https://relay.example/fs/multipart/chunk',
   direct_upload_token: 'secret-token', direct_remote_upload_id: 'remote-session',
   direct_resume_token: 'resume-0',
-  direct_part_urls_url: 'https://relay.example/fs/multipart/part-urls',
-  direct_ack_url: 'https://relay.example/fs/multipart/ack',
 };
 const response = data => ({ status: 200, text: JSON.stringify({ code: 200, data }) });
 const noWait = async () => {};
 
-test('direct first, sequential bytes, latest resume passed to next part and completion', async () => {
+test('Cloudflare relay uploads ordered bytes using the latest resume token', async () => {
   const input = Buffer.from('12345678901234567890'), calls = [], logs = [];
-  let index = 0;
-  const transport = { stats: { requests: 9, reused: 6 }, request: async (url, options) => {
-    if (url === session.direct_part_urls_url) {
-      assert.equal(options.headers['x-upload-session'], 'resume-' + index);
-      return response({ parts: [{ index, upload_url: 'https://upload.aliyundrive.net/part-' + index }] });
-    }
-    if (url.startsWith('https://upload.aliyundrive.net/')) {
-      assert.equal(options.deadlineMs, 180000);
-      assert.equal(options.idleTimeoutMs, 90000);
-      assert.equal(options.headers, undefined);
-      assert.deepEqual(options.body, input.subarray(index * 8, index * 8 + 8));
-      calls.push(index);
-      return { status: 200, text: '' };
-    }
-    assert.equal(url, session.direct_ack_url);
+  const transport = { stats: { requests: 3, reused: 2 }, request: async (url, options) => {
+    const index = calls.length;
+    assert.equal(url, session.direct_upload_url);
     assert.equal(options.headers['x-upload-session'], 'resume-' + index);
-    index++;
-    return response({ resume_token: 'resume-' + index });
+    assert.equal(options.headers['x-chunk-index'], String(index));
+    assert.equal(options.deadlineMs, 180000);
+    assert.equal(options.idleTimeoutMs, 120000);
+    assert.deepEqual(options.body, input.subarray(index * 8, index * 8 + 8));
+    calls.push(index);
+    return response({ resume_token: 'resume-' + (index + 1) });
   } };
-  const result = await uploadParts({ session, size: input.length, transport, log: text => logs.push(text), sleep: noWait,
+  const result = await uploadParts({ session, size: input.length, transport, log: line => logs.push(line), sleep: noWait,
     readPart: async (offset, length) => input.subarray(offset, offset + length),
     servicePost: async (path, body, headers) => {
       assert.equal(path, '/api/signing/multipart/complete');
@@ -48,34 +38,25 @@ test('direct first, sequential bytes, latest resume passed to next part and comp
   assert.ok(!logs.filter(line => !line.startsWith('::add-mask::')).join('\n').includes('secret-token'));
 });
 
-test('transient direct failure refreshes the signed URL and retries the same bytes', async () => {
-  let attempts = 0, completed = false;
-  let urls = 0;
-  const transport = { stats: { requests: 5, reused: 0 }, request: async (url, options) => {
-    if (url === session.direct_part_urls_url) {
-      urls++;
-      assert.equal(options.headers['x-upload-session'], 'resume-0');
-      return response({ parts: [{ index: 0, upload_url: 'https://upload.aliyundrive.net/part-' + urls }] });
-    }
-    if (url.startsWith('https://upload.aliyundrive.net/')) {
-      if (++attempts === 1) throw Object.assign(new Error('private URL and token'), { code: 'ESTALLED' });
-      return { status: 200, text: '' };
-    }
-    assert.equal(url, session.direct_ack_url);
-    return response({ resume_token: 'resume-1' });
-  } };
+test('a stalled relay retries the same bytes without contacting the provider directly', async () => {
+  let requests = 0;
   const logs = [];
-  await uploadParts({ session: { ...session, total_chunks: 1 }, size: 4, transport,
+  await uploadParts({ session: { ...session, total_chunks: 1 }, size: 4,
+    transport: { stats: {}, request: async (url, options) => {
+      assert.equal(url, session.direct_upload_url);
+      assert.deepEqual(options.body, Buffer.from('1234'));
+      assert.equal(options.headers['x-upload-session'], 'resume-0');
+      if (++requests === 1) throw Object.assign(new Error('private URL and token'), { code: 'ESTALLED' });
+      return response({ resume_token: 'resume-1' });
+    } },
     log: line => logs.push(line), sleep: noWait, readPart: async () => Buffer.from('1234'),
-    servicePost: async () => { completed = true; return { signed_ipa_url: 'https://download.example/signed.ipa' }; },
+    servicePost: async () => ({ signed_ipa_url: 'https://download.example/signed.ipa' }),
   });
-  assert.equal(attempts, 2);
-  assert.equal(urls, 2);
-  assert.equal(completed, true);
+  assert.equal(requests, 2);
   assert.ok(!logs.join('\n').includes('private URL'));
 });
 
-test('control auth failure is not retried or bypassed via relay', async () => {
+test('auth failure stops without retries or a route bypass', async () => {
   let requests = 0;
   await assert.rejects(uploadParts({ session: { ...session, total_chunks: 1 }, size: 4,
     transport: { stats: {}, request: async () => { requests++; return { status: 401, text: 'secret' }; } },
@@ -84,69 +65,37 @@ test('control auth failure is not retried or bypassed via relay', async () => {
   assert.equal(requests, 1);
 });
 
-test('direct provider failure falls back to relay using current resume', async () => {
-  const calls = [];
-  const transport = { stats: {}, request: async (url, options) => {
-    calls.push(url);
-    if (url === session.direct_part_urls_url) {
-      assert.equal(options.headers['x-upload-session'], 'resume-0');
-      return response({ parts: [{ index: 0, upload_url: 'https://upload.aliyundrive.net/part?signed=secret' }] });
-    }
-    if (url.startsWith('https://upload.aliyundrive.net')) {
-      assert.equal(options.deadlineMs, 180000);
-      assert.equal(options.headers, undefined);
-      return { status: 503, text: '' };
-    }
-    if (url === session.direct_upload_url) {
-      assert.equal(options.headers['x-upload-session'], 'resume-0');
-      return response({ resume_token: 'resume-1' });
-    }
-    assert.fail();
-  } };
-  await uploadParts({ session: { ...session, total_chunks: 1 }, size: 4, transport,
-    log: () => {}, sleep: noWait, readPart: async () => Buffer.from('1234'),
-    servicePost: async () => ({ signed_ipa_url: 'https://download.example/signed.ipa' }),
-  });
-  assert.equal(calls.filter(url => url === session.direct_part_urls_url).length, 3);
-  assert.equal(calls.filter(url => url.startsWith('https://upload.aliyundrive.net')).length, 3);
-  assert.equal(calls.filter(url => url === session.direct_upload_url).length, 1);
-});
-
-test('acknowledgement failure never resends an accepted part through relay', async () => {
-  let puts = 0, acknowledgements = 0, relays = 0;
-  await assert.rejects(uploadParts({ session: { ...session, total_chunks: 1 }, size: 4,
-    transport: { stats: {}, request: async url => {
-      if (url === session.direct_part_urls_url) return response({ parts: [{ index: 0, upload_url: 'https://upload.aliyundrive.net/part' }] });
-      if (url.startsWith('https://upload.aliyundrive.net/')) { puts++; return { status: 200, text: '' }; }
-      if (url === session.direct_ack_url) { acknowledgements++; return { status: 503, text: '' }; }
-      if (url === session.direct_upload_url) relays++;
-      assert.fail();
+test('upload budget bounds attempts and never publishes an incomplete file', async () => {
+  let time = 0, requests = 0;
+  await assert.rejects(uploadParts({ session: { ...session, total_chunks: 1 }, size: 4, budgetMs: 50, now: () => time,
+    transport: { stats: {}, request: async (_url, options) => {
+      requests++;
+      assert.equal(options.deadlineMs, 50);
+      time = 50;
+      throw Object.assign(new Error('timed out'), { code: 'EDEADLINE' });
     } },
     log: () => {}, sleep: noWait, readPart: async () => Buffer.from('1234'), servicePost: async () => assert.fail(),
-  }), error => error.code === 'HTTP_503');
-  assert.equal(puts, 1);
-  assert.equal(acknowledgements, 3);
-  assert.equal(relays, 0);
+  }), error => error.code === 'EUPLOADDEADLINE');
+  assert.equal(requests, 1);
 });
 
-test('bad sizes and unsafe endpoint protocols fail before transmitting credentials', async () => {
+test('bad sizes and unsafe endpoints fail before transmitting credentials', async () => {
   const args = { session, size: 20, transport: { stats: {}, request: async () => assert.fail() }, log: () => {}, readPart: async () => assert.fail() };
   await assert.rejects(uploadParts({ ...args, session: { ...session, total_chunks: 4 } }), error => error.code === 'EPROTOCOL');
   await assert.rejects(uploadParts({ ...args, session: { ...session, direct_upload_url: 'http://relay.example' } }), error => error.code === 'EPROTOCOL');
 });
 
-test('transport reuses a connection, does not follow redirects, detects no-progress stall', async () => {
+test('transport reuses a connection, rejects redirects and detects a stalled response', async () => {
   let connections = 0;
   const server = http.createServer((req, res) => {
     req.resume();
     if (req.url === '/stall') return;
     if (req.url === '/redirect') { res.writeHead(302, { location: '/secret' }); res.end(); return; }
-    res.setHeader('content-type', 'application/json');
     res.end('{"ok":true}');
   });
   server.on('connection', () => connections++);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
+  const base = 'http://127.0.0.1:' + server.address().port;
   const transport = createTransport({ allowHttp: true, connectMs: 1000, idleMs: 70, totalMs: 1000 });
   try {
     for (let i = 0; i < 3; i++) assert.equal((await transport.request(base + '/ok', { body: 'test' })).status, 200);
@@ -157,23 +106,21 @@ test('transport reuses a connection, does not follow redirects, detects no-progr
     await assert.rejects(transport.request(base + '/stall'), error => error.code === 'ESTALLED');
     assert.ok(Date.now() - started < 700);
   } finally {
-    transport.close();
-    server.closeAllConnections();
+    transport.close(); server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   }
 });
 
-test('request hard cap remains effective even with periodic response data', async () => {
+test('request deadline applies even with periodic response data', async () => {
   const server = http.createServer((req, res) => {
-    req.resume();
-    res.writeHead(200);
+    req.resume(); res.writeHead(200);
     const timer = setInterval(() => res.write(' '), 15);
     res.on('close', () => clearInterval(timer));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const transport = createTransport({ allowHttp: true, connectMs: 1000, idleMs: 100, totalMs: 120 });
   try {
-    await assert.rejects(transport.request(`http://127.0.0.1:${server.address().port}`), error => error.code === 'EDEADLINE');
+    await assert.rejects(transport.request('http://127.0.0.1:' + server.address().port), error => error.code === 'EDEADLINE');
   } finally {
     transport.close(); server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
