@@ -28,3 +28,9 @@ test('signer output suppresses identities, secrets and forged workflow commands'
 test('failed signer keeps exit status without printing its raw error',async()=>{
   const logs=[];const code=await runPrivateSigner({command:process.execPath,args:['-e','console.error("secret-certificate and signed URL");process.exit(7)'],log:l=>logs.push(l)});assert.equal(code,7);assert.ok(logs.includes('Signing failed (exit 7)'));assert.ok(!logs.join('\n').includes('secret-certificate'));
 });
+
+test('root Info.plist lookup consumes the full unzip listing instead of causing SIGPIPE 141',async()=>{
+  const source=await readFile(new URL('./sign-ipa.sh',import.meta.url),'utf8');
+  assert.match(source,/Info\.plist.*&& !found \{ print; found=1 \}/);
+  assert.doesNotMatch(source,/Info\.plist.*\{ print; exit \}/);
+});
