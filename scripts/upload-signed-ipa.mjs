@@ -1,3 +1,4 @@
+
 import https from 'node:https';
 import http from 'node:http';
 import { open, stat } from 'node:fs/promises';
@@ -177,7 +178,7 @@ export async function main(file = process.argv[2] || 'signed.ipa') {
       headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', ...headers },
       body: JSON.stringify({ job_id: jobId, claim_token: claimToken, ...data }),
     })));
-    const session = await servicePost('/api/signing/multipart/init', { size_bytes: size });
+    const initStarted = Date.now();    console.error('Preparing OpenList upload session');    const session = await servicePost('/api/signing/multipart/init', { size_bytes: size }); console.error(`OpenList upload session ready in ${((Date.now() - initStarted) / 1000).toFixed(2)}s`);
     handle = await open(file, 'r');
     const result = await uploadParts({ session, size, transport, servicePost,
       readPart: async (position, length) => {
