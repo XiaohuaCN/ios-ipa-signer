@@ -14,15 +14,26 @@ const session = {
 const response = data => ({ status: 200, text: JSON.stringify({ code: 200, data }) });
 const noWait = async () => {};
 
-test('relay first, sequential bytes, latest resume passed to next part and completion', async () => {
+test('direct first, sequential bytes, latest resume passed to next part and completion', async () => {
   const input = Buffer.from('12345678901234567890'), calls = [], logs = [];
-  const transport = { stats: { requests: 3, reused: 2 }, request: async (url, options) => {
-    const index = Number(options.headers['x-chunk-index']);
-    assert.equal(url, session.direct_upload_url);
+  let index = 0;
+  const transport = { stats: { requests: 9, reused: 6 }, request: async (url, options) => {
+    if (url === session.direct_part_urls_url) {
+      assert.equal(options.headers['x-upload-session'], 'resume-' + index);
+      return response({ parts: [{ index, upload_url: 'https://upload.aliyundrive.net/part-' + index }] });
+    }
+    if (url.startsWith('https://upload.aliyundrive.net/')) {
+      assert.equal(options.deadlineMs, 180000);
+      assert.equal(options.idleTimeoutMs, 90000);
+      assert.equal(options.headers, undefined);
+      assert.deepEqual(options.body, input.subarray(index * 8, index * 8 + 8));
+      calls.push(index);
+      return { status: 200, text: '' };
+    }
+    assert.equal(url, session.direct_ack_url);
     assert.equal(options.headers['x-upload-session'], 'resume-' + index);
-    assert.deepEqual(options.body, input.subarray(index * 8, index * 8 + 8));
-    calls.push(index);
-    return response({ resume_token: 'resume-' + (index + 1) });
+    index++;
+    return response({ resume_token: 'resume-' + index });
   } };
   const result = await uploadParts({ session, size: input.length, transport, log: text => logs.push(text), sleep: noWait,
     readPart: async (offset, length) => input.subarray(offset, offset + length),
@@ -37,12 +48,20 @@ test('relay first, sequential bytes, latest resume passed to next part and compl
   assert.ok(!logs.filter(line => !line.startsWith('::add-mask::')).join('\n').includes('secret-token'));
 });
 
-test('transient failure retries the same bytes and continuation, not next part', async () => {
+test('transient direct failure refreshes the signed URL and retries the same bytes', async () => {
   let attempts = 0, completed = false;
-  const transport = { stats: { requests: 2, reused: 0 }, request: async (_url, options) => {
-    assert.equal(options.headers['x-chunk-index'], '0');
-    assert.equal(options.headers['x-upload-session'], 'resume-0');
-    if (++attempts === 1) throw Object.assign(new Error('private URL and token'), { code: 'ESTALLED' });
+  let urls = 0;
+  const transport = { stats: { requests: 5, reused: 0 }, request: async (url, options) => {
+    if (url === session.direct_part_urls_url) {
+      urls++;
+      assert.equal(options.headers['x-upload-session'], 'resume-0');
+      return response({ parts: [{ index: 0, upload_url: 'https://upload.aliyundrive.net/part-' + urls }] });
+    }
+    if (url.startsWith('https://upload.aliyundrive.net/')) {
+      if (++attempts === 1) throw Object.assign(new Error('private URL and token'), { code: 'ESTALLED' });
+      return { status: 200, text: '' };
+    }
+    assert.equal(url, session.direct_ack_url);
     return response({ resume_token: 'resume-1' });
   } };
   const logs = [];
@@ -51,11 +70,12 @@ test('transient failure retries the same bytes and continuation, not next part',
     servicePost: async () => { completed = true; return { signed_ipa_url: 'https://download.example/signed.ipa' }; },
   });
   assert.equal(attempts, 2);
+  assert.equal(urls, 2);
   assert.equal(completed, true);
   assert.ok(!logs.join('\n').includes('private URL'));
 });
 
-test('auth failure is not retried or bypassed via direct upload', async () => {
+test('control auth failure is not retried or bypassed via relay', async () => {
   let requests = 0;
   await assert.rejects(uploadParts({ session: { ...session, total_chunks: 1 }, size: 4,
     transport: { stats: {}, request: async () => { requests++; return { status: 401, text: 'secret' }; } },
@@ -64,29 +84,49 @@ test('auth failure is not retried or bypassed via direct upload', async () => {
   assert.equal(requests, 1);
 });
 
-test('one capped alternate route uses current resume and omits provider Content-Type', async () => {
+test('direct provider failure falls back to relay using current resume', async () => {
   const calls = [];
   const transport = { stats: {}, request: async (url, options) => {
     calls.push(url);
-    if (url === session.direct_upload_url) return { status: 503, text: '' };
     if (url === session.direct_part_urls_url) {
       assert.equal(options.headers['x-upload-session'], 'resume-0');
-      return response({ parts: [{ index: 0, upload_url: 'https://provider.example/part?signed=secret' }] });
+      return response({ parts: [{ index: 0, upload_url: 'https://upload.aliyundrive.net/part?signed=secret' }] });
     }
-    if (url.startsWith('https://provider.example')) {
-      assert.equal(options.deadlineMs, 10000);
+    if (url.startsWith('https://upload.aliyundrive.net')) {
+      assert.equal(options.deadlineMs, 180000);
       assert.equal(options.headers, undefined);
-      return { status: 200, text: '' };
+      return { status: 503, text: '' };
     }
-    if (url === session.direct_ack_url) return response({ resume_token: 'resume-1' });
+    if (url === session.direct_upload_url) {
+      assert.equal(options.headers['x-upload-session'], 'resume-0');
+      return response({ resume_token: 'resume-1' });
+    }
     assert.fail();
   } };
   await uploadParts({ session: { ...session, total_chunks: 1 }, size: 4, transport,
     log: () => {}, sleep: noWait, readPart: async () => Buffer.from('1234'),
     servicePost: async () => ({ signed_ipa_url: 'https://download.example/signed.ipa' }),
   });
-  assert.equal(calls.filter(url => url === session.direct_upload_url).length, 3);
-  assert.equal(calls.filter(url => url.startsWith('https://provider.example')).length, 1);
+  assert.equal(calls.filter(url => url === session.direct_part_urls_url).length, 3);
+  assert.equal(calls.filter(url => url.startsWith('https://upload.aliyundrive.net')).length, 3);
+  assert.equal(calls.filter(url => url === session.direct_upload_url).length, 1);
+});
+
+test('acknowledgement failure never resends an accepted part through relay', async () => {
+  let puts = 0, acknowledgements = 0, relays = 0;
+  await assert.rejects(uploadParts({ session: { ...session, total_chunks: 1 }, size: 4,
+    transport: { stats: {}, request: async url => {
+      if (url === session.direct_part_urls_url) return response({ parts: [{ index: 0, upload_url: 'https://upload.aliyundrive.net/part' }] });
+      if (url.startsWith('https://upload.aliyundrive.net/')) { puts++; return { status: 200, text: '' }; }
+      if (url === session.direct_ack_url) { acknowledgements++; return { status: 503, text: '' }; }
+      if (url === session.direct_upload_url) relays++;
+      assert.fail();
+    } },
+    log: () => {}, sleep: noWait, readPart: async () => Buffer.from('1234'), servicePost: async () => assert.fail(),
+  }), error => error.code === 'HTTP_503');
+  assert.equal(puts, 1);
+  assert.equal(acknowledgements, 3);
+  assert.equal(relays, 0);
 });
 
 test('bad sizes and unsafe endpoint protocols fail before transmitting credentials', async () => {

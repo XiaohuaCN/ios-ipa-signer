@@ -1,4 +1,3 @@
-
 import https from 'node:https';
 import http from 'node:http';
 import { open, stat } from 'node:fs/promises';
@@ -15,7 +14,7 @@ export function createTransport({ allowHttp = false, connectMs = 15000, idleMs =
   return {
     stats,
     close() { for (const agent of Object.values(agents)) agent.destroy(); },
-    request(target, { method = 'POST', headers = {}, body = Buffer.alloc(0), deadlineMs = totalMs } = {}) {
+    request(target, { method = 'POST', headers = {}, body = Buffer.alloc(0), deadlineMs = totalMs, idleTimeoutMs = idleMs } = {}) {
       return new Promise((resolve, reject) => {
         let url;
         try {
@@ -57,7 +56,7 @@ export function createTransport({ allowHttp = false, connectMs = 15000, idleMs =
           if (!socket.connecting) clearTimeout(connectionTimer);
           else socket.once(url.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer));
           // This tracks socket inactivity, not merely elapsed upload time.
-          req.setTimeout(Math.min(idleMs, deadlineMs), () => timedOut('ESTALLED'));
+          req.setTimeout(Math.min(idleTimeoutMs, deadlineMs), () => timedOut('ESTALLED'));
         });
         req.on('error', error => finish(error));
         req.end(bytes);
@@ -106,6 +105,12 @@ function secureUrl(value) {
   if (url.protocol !== 'https:' || url.username || url.password || url.hash) throw protocolError();
   return url.href;
 }
+function secureProviderUrl(value) {
+  const target = secureUrl(value);
+  const host = new URL(target).hostname.toLowerCase();
+  if (!host.endsWith('.aliyundrive.net') && !host.endsWith('.aliyunpds.com')) throw protocolError();
+  return target;
+}
 
 export async function uploadParts({ session, size, readPart, transport, servicePost, log = console.error, sleep }) {
   const chunkSize = Number(session.chunk_size), total = Number(session.total_chunks);
@@ -116,41 +121,53 @@ export async function uploadParts({ session, size, readPart, transport, serviceP
   if (!remoteId || !session.upload_id) throw protocolError();
   const token = mask(session.direct_upload_token, log);
   let resume = mask(session.direct_resume_token, log);
-  let directDisabled = false, uploaded = 0;
+  let uploaded = 0;
   const started = Date.now();
-  log(`Upload route: OpenList relay first; pooled connections; ${total} parts; idle timeout 20s`);
+  log(`Upload route: direct provider first; ${total} parts; 180s per-part deadline`);
+  const partControl = secureUrl(session.direct_part_urls_url), ackControl = secureUrl(session.direct_ack_url);
+  mask(partControl, log); mask(ackControl, log);
+  if (new URL(partControl).origin !== new URL(relayUrl).origin || new URL(ackControl).origin !== new URL(relayUrl).origin) throw protocolError();
   for (let index = 0; index < total; index++) {
     const partStart = Date.now();
     const expected = Math.min(chunkSize, size - index * chunkSize);
     const bytes = await readPart(index * chunkSize, expected);
     if (!Buffer.isBuffer(bytes) || bytes.length !== expected) throw protocolError();
-    let remote, route = 'relay';
+    let remote, route = 'direct', providerAccepted = false;
     const remoteHeaders = () => ({ authorization: token, 'x-upload-id': remoteId, 'x-upload-session': resume });
     try {
-      remote = await withRetry(async () => jsonResponse(await transport.request(relayUrl, {
-        method: 'PUT', headers: { ...remoteHeaders(), 'x-chunk-index': String(index), 'content-type': 'application/octet-stream' }, body: bytes,
-      }), true), { log, sleep });
-    } catch (error) {
-      // Do not bypass auth/config errors. Try the alternate byte route only
-      // after transient relay failures, and never spend 30s probing it first.
-      if (error.retryable === false || ['EENDPOINT', 'EPROTOCOL'].includes(safeCode(error)) || directDisabled || !session.direct_part_urls_url || !session.direct_ack_url) throw error;
-      directDisabled = true;
-      const partControl = secureUrl(session.direct_part_urls_url), ackControl = secureUrl(session.direct_ack_url);
-      mask(partControl, log); mask(ackControl, log);
-      if (new URL(partControl).origin !== new URL(relayUrl).origin || new URL(ackControl).origin !== new URL(relayUrl).origin) throw protocolError();
-      log('Relay unavailable after retries; trying direct provider route once (10s cap)');
-      const urls = await withRetry(async () => jsonResponse(await transport.request(partControl, {
-        headers: { ...remoteHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ indices: [index] }),
-      }), true), { log, sleep });
-      const signedUrl = secureUrl(urls.parts?.find(part => part.index === index)?.upload_url);
-      mask(signedUrl, log);
-      // A Content-Type header breaks the provider's signed PUT URL.
-      const direct = await transport.request(signedUrl, { method: 'PUT', body: bytes, deadlineMs: 10000 });
-      if (direct.status !== 200) throw Object.assign(new Error('Direct upload failed'), { code: 'HTTP_' + direct.status, retryable: false });
+      await withRetry(async () => {
+        const urls = jsonResponse(await transport.request(partControl, {
+          headers: { ...remoteHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ indices: [index] }),
+        }), true);
+        if (urls.resume_token) resume = mask(urls.resume_token, log);
+        const signedUrl = secureProviderUrl(urls.parts?.find(part => part.index === index)?.upload_url);
+        mask(signedUrl, log);
+        // Do not add Content-Type: it changes the provider's signed PUT request.
+        const uploadedPart = await transport.request(signedUrl, {
+          method: 'PUT', body: bytes, deadlineMs: 180000, idleTimeoutMs: 90000,
+        });
+        if (uploadedPart.status !== 200) throw Object.assign(new Error('Provider rejected part'), {
+          code: 'HTTP_' + uploadedPart.status,
+          retryable: uploadedPart.status === 403 || uploadedPart.status === 408 || uploadedPart.status === 429 || uploadedPart.status >= 500,
+        });
+      }, { log, sleep });
+      providerAccepted = true;
+      // Retry acknowledgement without retransmitting bytes if the control
+      // request stalls after the provider accepted the part.
       remote = await withRetry(async () => jsonResponse(await transport.request(ackControl, {
         headers: { ...remoteHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ indices: [index] }),
       }), true), { log, sleep });
-      route = 'direct';
+    } catch (error) {
+      // A failed acknowledgement is ambiguous: the provider may already
+      // have accepted the bytes. Let the job retry instead of relaying twice.
+      if (providerAccepted) throw error;
+      if (error.retryable === false || ['EENDPOINT', 'EPROTOCOL'].includes(safeCode(error))) throw error;
+      log('Direct provider route unavailable; trying OpenList relay for this part');
+      remote = await withRetry(async () => jsonResponse(await transport.request(relayUrl, {
+        method: 'PUT', headers: { ...remoteHeaders(), 'x-chunk-index': String(index), 'content-type': 'application/octet-stream' }, body: bytes,
+        deadlineMs: 180000, idleTimeoutMs: 60000,
+      }), true), { log, sleep });
+      route = 'relay';
     }
     resume = mask(remote.resume_token, log);
     uploaded += expected;
@@ -178,7 +195,10 @@ export async function main(file = process.argv[2] || 'signed.ipa') {
       headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', ...headers },
       body: JSON.stringify({ job_id: jobId, claim_token: claimToken, ...data }),
     })));
-    const initStarted = Date.now();    console.error('Preparing OpenList upload session');    const session = await servicePost('/api/signing/multipart/init', { size_bytes: size }); console.error(`OpenList upload session ready in ${((Date.now() - initStarted) / 1000).toFixed(2)}s`);
+    const initStarted = Date.now();
+    console.error('Preparing OpenList upload session');
+    const session = await servicePost('/api/signing/multipart/init', { size_bytes: size });
+    console.error(`OpenList upload session ready in ${((Date.now() - initStarted) / 1000).toFixed(2)}s`);
     handle = await open(file, 'r');
     const result = await uploadParts({ session, size, transport, servicePost,
       readPart: async (position, length) => {
