@@ -31,7 +31,7 @@ mkdir -p "$(dirname "$OUTPUT_IPA")"
 # the binary plist. zsign's internal UTF-16 reader does not combine surrogate
 # pairs, so non-BMP characters such as emoji can become a different identifier
 # inside the Mach-O CodeDirectory even though Info.plist still looks correct.
-BUNDLE_PLIST_ENTRY="$(LC_ALL=C unzip -Z1 "$INPUT_IPA" | LC_ALL=C awk -F/ '$1 == "Payload" && $2 ~ /\.app$/ && $3 == "Info.plist" { print; exit }')"
+BUNDLE_PLIST_ENTRY="$(LC_ALL=C unzip -Z1 "$INPUT_IPA" | LC_ALL=C awk -F/ '$1 == "Payload" && $2 ~ /\.app$/ && $3 == "Info.plist" && !found { print; found=1 }')"
 [ -n "$BUNDLE_PLIST_ENTRY" ] || {
   echo 'Unable to locate the root app Info.plist in the IPA' >&2
   exit 1
