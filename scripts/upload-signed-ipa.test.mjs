@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createTransport, uploadParts } from './upload-signed-ipa.mjs';
+import { createTransport, uploadParts, uploadOssFile } from './upload-signed-ipa.mjs';
 
 const session = {
   upload_id: 'local-session', chunk_size: 8, total_chunks: 3,
@@ -11,6 +11,41 @@ const session = {
 };
 const response = data => ({ status: 200, text: JSON.stringify({ code: 200, data }) });
 const noWait = async () => {};
+const oss = {
+  storage: 'oss', upload_url: 'https://private-bucket.oss-accelerate.aliyuncs.com/ipa/XY/signed.ipa?Signature=private-secret',
+  upload_headers: { 'Content-Type': 'application/octet-stream' },
+  signed_ipa_url: 'https://private-bucket.oss-cn-hangzhou.aliyuncs.com/ipa/XY/signed.ipa',
+};
+test('OSS upload streams one file directly and retains the original public download host', async () => {
+  const logs = [], calls = [];
+  const result = await uploadOssFile({ file: 'signed.ipa', size: 512, ticket: oss, log: line => logs.push(line),
+    getTicket: () => assert.fail('No unnecessary refresh'), put: async options => { calls.push(options); return { status: 200, bytes: 512 }; },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, 'signed.ipa');
+  assert.equal(calls[0].url, oss.upload_url);
+  assert.equal(result, oss.signed_ipa_url);
+  assert.ok(!logs.filter(line => !line.startsWith('::add-mask::')).join('\n').includes('private-bucket'));
+});
+test('expired OSS credentials refresh before retry; storage response contents stay private', async () => {
+  let uploads = 0, refreshes = 0;
+  const refreshed = { ...oss, upload_url: oss.upload_url.replace('private-secret', 'fresh-secret') };
+  await uploadOssFile({ file: 'signed.ipa', size: 512, ticket: oss, log: () => {}, sleep: noWait,
+    getTicket: async () => { refreshes++; return refreshed; },
+    put: async options => { if (++uploads === 1) return { status: 403, bytes: 0 }; assert.equal(options.url, refreshed.upload_url); return { status: 200, bytes: 512 }; },
+  });
+  assert.equal(uploads, 2); assert.equal(refreshes, 1);
+});
+test('OSS endpoints cannot redirect private data to an arbitrary host or return a different object', async () => {
+  for (const ticket of [{ ...oss, upload_url: 'https://attacker.example/file' }, { ...oss, signed_ipa_url: oss.signed_ipa_url + 'wrong' }]) {
+    await assert.rejects(uploadOssFile({ file: 'signed.ipa', size: 512, ticket, log: () => {}, put: () => assert.fail() }), error => error.code === 'EPROTOCOL');
+  }
+});
+test('incomplete OSS transfers and redirects never publish a successful output', async () => {
+  for (const reply of [{ status: 200, bytes: 511 }, { status: 302, bytes: 512 }]) {
+    await assert.rejects(uploadOssFile({ file: 'signed.ipa', size: 512, ticket: oss, log: () => {}, put: async () => reply }));
+  }
+});
 
 test('Cloudflare relay uploads ordered bytes using the latest resume token', async () => {
   const input = Buffer.from('12345678901234567890'), calls = [], logs = [];

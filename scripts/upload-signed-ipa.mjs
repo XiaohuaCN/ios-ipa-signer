@@ -2,6 +2,7 @@ import https from 'node:https';
 import http from 'node:http';
 import { open, stat } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
 
 // One process and pooled TLS connections for the entire sequential upload.
 // Never follow redirects carrying credentials or print signed storage URLs.
@@ -89,7 +90,7 @@ export async function withRetry(operation, { attempts = 3, log = console.error, 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try { return await operation(); } catch (error) {
       if (error.retryable === false || ['EENDPOINT', 'EPROTOCOL'].includes(safeCode(error)) || attempt === attempts) throw error;
-      log(`Upload retry ${attempt}/${attempts - 1}: ${safeCode(error)}; retrying the same part`);
+      log(`Upload retry ${attempt}/${attempts - 1}: ${safeCode(error)}`);
       await sleep(Math.min(8000, 1000 * 2 ** attempt));
     }
   }
@@ -104,6 +105,60 @@ function secureUrl(value) {
   try { url = new URL(value); } catch { throw protocolError(); }
   if (url.protocol !== 'https:' || url.username || url.password || url.hash) throw protocolError();
   return url.href;
+}
+function ossTicket(ticket) {
+  const upload = new URL(secureUrl(ticket.upload_url));
+  const download = new URL(secureUrl(ticket.signed_ipa_url));
+  if (!/^[a-z0-9-]+\.oss-(?:accelerate|[a-z0-9-]+)\.aliyuncs\.com$/.test(upload.hostname) ||
+      download.hostname !== upload.hostname.replace('.oss-accelerate.', '.oss-cn-hangzhou.') ||
+      download.pathname !== upload.pathname || download.search ||
+      ticket.upload_headers?.['Content-Type'] !== 'application/octet-stream') throw protocolError();
+  return { upload: upload.href, download: download.href };
+}
+// Only the public output URL reaches stdout. The private upload URL is fed
+// through stdin, never included in process arguments or curl diagnostics.
+export function curlPut({ file, url, deadlineMs }) {
+  return new Promise((resolve, reject) => {
+    const quote = value => '"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+    const child = spawn('curl', ['--disable', '--silent', '--proto', '=https', '--connect-timeout', '20',
+      '--max-time', String(Math.max(1, Math.floor(deadlineMs / 1000))), '--speed-limit', '1024', '--speed-time', '90',
+      '--upload-file', file, '--output', '/dev/null', '--write-out', '%{http_code} %{size_upload} %{time_total}', '--config', '-'],
+    { stdio: ['pipe', 'pipe', 'ignore'] });
+    let output = '', tooLarge = false;
+    const timer = setTimeout(() => child.kill('SIGKILL'), deadlineMs + 1000);
+    child.stdout.on('data', bytes => { output += bytes; if (output.length > 1024) { tooLarge = true; child.kill(); } });
+    child.stdin.on('error', () => {});
+    child.on('error', () => { clearTimeout(timer); reject(Object.assign(new Error('Upload process unavailable'), { code: 'EPROCESS', retryable: false })); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (tooLarge) return reject(protocolError());
+      if (code !== 0) return reject(Object.assign(new Error('Storage connection interrupted'), { code: 'ECURL_' + (Number.isInteger(code) ? code : 'TIMEOUT') }));
+      const fields = output.trim().split(/\s+/);
+      if (fields.length !== 3 || !/^\d{3}$/.test(fields[0]) || !Number.isFinite(Number(fields[1]))) return reject(protocolError());
+      resolve({ status: Number(fields[0]), bytes: Number(fields[1]) });
+    });
+    child.stdin.end('url = ' + quote(url) + '\nheader = "Content-Type: application/octet-stream"\n');
+  });
+}
+export async function uploadOssFile({ file, size, ticket, getTicket, put = curlPut, log = console.error, sleep, now = Date.now, budgetMs = 30 * 60 * 1000 }) {
+  if (!Number.isSafeInteger(size) || size <= 0) throw protocolError();
+  const started = now();
+  let attempt = 0;
+  log('Upload route: direct OSS; signed IPA bytes do not pass through Cloudflare or OpenList');
+  return withRetry(async () => {
+    const remaining = budgetMs - (now() - started);
+    if (remaining <= 0) throw Object.assign(new Error('Upload deadline exceeded'), { code: 'EUPLOADDEADLINE', retryable: false });
+    const current = attempt++ === 0 ? ticket : await getTicket();
+    const urls = ossTicket(current);
+    mask(urls.upload, log); mask(urls.download, log);
+    const response = await put({ file, url: urls.upload, deadlineMs: remaining });
+    if (response.status < 200 || response.status >= 300) throw Object.assign(new Error('Storage HTTP ' + response.status), {
+      code: 'HTTP_' + response.status, retryable: [403, 408, 429].includes(response.status) || response.status >= 500,
+    });
+    if (response.bytes !== size) throw protocolError();
+    log(`Upload complete: ${(size / 1048576).toFixed(2)} MiB in ${((now() - started) / 1000).toFixed(2)}s`);
+    return urls.download;
+  }, { log, sleep });
 }
 export async function uploadParts({ session, size, readPart, transport, servicePost, log = console.error, sleep, now = Date.now, budgetMs = 30 * 60 * 1000 }) {
   const chunkSize = Number(session.chunk_size), total = Number(session.total_chunks);
@@ -161,7 +216,15 @@ export async function main(file = process.argv[2] || 'signed.ipa') {
       body: JSON.stringify({ job_id: jobId, claim_token: claimToken, ...data }),
     })));
     const initStarted = Date.now();
-    console.error('Preparing OpenList upload session');
+    const getTicket = () => servicePost('/api/signing/upload-ticket', {});
+    const ticket = await getTicket();
+    if (ticket.storage === 'oss' || (!ticket.storage && /^https:\/\/[a-z0-9-]+\.oss-[a-z0-9-]+\.aliyuncs\.com\//.test(ticket.upload_url || ''))) {
+      const result = await uploadOssFile({ file, size, ticket, getTicket });
+      process.stdout.write(result + '\n');
+      return;
+    }
+    if (ticket.storage && ticket.storage !== 'openlist') throw protocolError();
+    console.error('Preparing storage upload session');
     const session = await servicePost('/api/signing/multipart/init', { size_bytes: size });
     console.error(`OpenList upload session ready in ${((Date.now() - initStarted) / 1000).toFixed(2)}s`);
     handle = await open(file, 'r');
