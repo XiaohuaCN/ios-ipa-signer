@@ -13,6 +13,25 @@ async function workspace(fn) {
 const url = 'https://storage.example/source.ipa?secret=never-log-this';
 const noWait = async () => {};
 
+test('real curl download shows safe numeric progress without exposing private URLs', () => workspace(async dir => {
+  const bytes = Buffer.alloc(256 * 1024, 5), logs = [];
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Length': bytes.length });
+    res.write(bytes.subarray(0, bytes.length / 2));
+    const timer = setTimeout(() => res.end(bytes.subarray(bytes.length / 2)), 1200);
+    res.on('close', () => clearTimeout(timer));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await curlDownload('http://127.0.0.1:' + server.address().port + '/source?Signature=secret', join(dir, 'out'),
+      { allowHttp: true, expectedSize: bytes.length, log: s => logs.push(s), progressIntervalMs: 0 });
+    assert.equal(result.code, 0); assert.equal(result.status, 200);
+    assert.deepEqual(await readFile(join(dir, 'out')), bytes);
+    assert.ok(logs.some(s => s.startsWith('Source download: 100%')));
+    assert.ok(!logs.join('\n').includes('Signature')); assert.ok(!logs.join('\n').includes('secret'));
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+}));
+
 test('retry connection reset without appending partial bytes; publish only verified file', () => workspace(async dir => {
   const output = join(dir, 'input.ipa'), logs = []; let attempts = 0, validated = 0;
   await writeFile(output, 'old');

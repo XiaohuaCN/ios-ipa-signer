@@ -3,6 +3,7 @@ import http from 'node:http';
 import { open, stat } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
+import { createTransferProgress } from './transfer-progress.mjs';
 
 // One process and pooled TLS connections for the entire sequential upload.
 // Never follow redirects carrying credentials or print signed storage URLs.
@@ -117,13 +118,15 @@ function ossTicket(ticket) {
 }
 // Only the public output URL reaches stdout. The private upload URL is fed
 // through stdin, never included in process arguments or curl diagnostics.
-export function curlPut({ file, url, deadlineMs }) {
+export function curlPut({ file, url, deadlineMs, size = 0, log = console.error, progressIntervalMs = 5000, allowHttp = false }) {
   return new Promise((resolve, reject) => {
     const quote = value => '"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
-    const child = spawn('curl', ['--disable', '--silent', '--proto', '=https', '--connect-timeout', '20',
+    const child = spawn('curl', ['--disable', '--progress-meter', '--proto', allowHttp ? '=http,https' : '=https', '--connect-timeout', '20',
       '--max-time', String(Math.max(1, Math.floor(deadlineMs / 1000))), '--speed-limit', '1024', '--speed-time', '90',
       '--upload-file', file, '--output', '/dev/null', '--write-out', '%{http_code} %{size_upload} %{time_total}', '--config', '-'],
-    { stdio: ['pipe', 'pipe', 'ignore'] });
+    { stdio: ['pipe', 'pipe', 'pipe'] });
+    const progress = createTransferProgress('upload', { total: size, log, intervalMs: progressIntervalMs });
+    child.stderr.on('data', chunk => progress.push(chunk));
     let output = '', tooLarge = false;
     const timer = setTimeout(() => child.kill('SIGKILL'), deadlineMs + 1000);
     child.stdout.on('data', bytes => { output += bytes; if (output.length > 1024) { tooLarge = true; child.kill(); } });
@@ -131,6 +134,7 @@ export function curlPut({ file, url, deadlineMs }) {
     child.on('error', () => { clearTimeout(timer); reject(Object.assign(new Error('Upload process unavailable'), { code: 'EPROCESS', retryable: false })); });
     child.on('close', code => {
       clearTimeout(timer);
+      progress.end();
       if (tooLarge) return reject(protocolError());
       if (code !== 0) return reject(Object.assign(new Error('Storage connection interrupted'), { code: 'ECURL_' + (Number.isInteger(code) ? code : 'TIMEOUT') }));
       const fields = output.trim().split(/\s+/);
@@ -151,7 +155,7 @@ export async function uploadOssFile({ file, size, ticket, getTicket, put = curlP
     const current = attempt++ === 0 ? ticket : await getTicket();
     const urls = ossTicket(current);
     mask(urls.upload, log); mask(urls.download, log);
-    const response = await put({ file, url: urls.upload, deadlineMs: remaining });
+    const response = await put({ file, url: urls.upload, deadlineMs: remaining, size, log });
     if (response.status < 200 || response.status >= 300) throw Object.assign(new Error('Storage HTTP ' + response.status), {
       code: 'HTTP_' + response.status, retryable: [403, 408, 429].includes(response.status) || response.status >= 500,
     });

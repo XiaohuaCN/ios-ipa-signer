@@ -3,6 +3,7 @@ import { mkdtemp, stat, rename, rm } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
+import { createTransferProgress } from './transfer-progress.mjs';
 
 const exec = promisify(execFile);
 const error = code => Object.assign(new Error(code), { code });
@@ -12,7 +13,8 @@ export function retryableCurl(code, status) {
   return transientCurlCodes.has(code) || (code === 22 && (status === 408 || status === 429 || status >= 500));
 }
 
-export function curlDownload(url, file, { allowHttp = false, connectSeconds = 15, idleSeconds = 20, maxSeconds = 900 } = {}) {
+export function curlDownload(url, file, { allowHttp = false, connectSeconds = 15, idleSeconds = 20, maxSeconds = 900,
+  expectedSize = 0, log = console.error, progressIntervalMs = 5000 } = {}) {
   const protocol = allowHttp ? '=http,https' : '=https';
   return new Promise((resolveResult, reject) => {
     // Keep source/signed redirect URLs out of argv, logs, and curl stderr.
@@ -21,12 +23,14 @@ export function curlDownload(url, file, { allowHttp = false, connectSeconds = 15
       '--proto', protocol, '--proto-redir', protocol,
       '--connect-timeout', String(connectSeconds), '--speed-limit', '1024',
       '--speed-time', String(idleSeconds), '--max-time', String(maxSeconds),
-      '--silent', '--show-error', '--output', file, '--write-out', '%{http_code}',
-    ], { stdio: ['pipe', 'pipe', 'ignore'] });
+      '--progress-meter', '--output', file, '--write-out', '%{http_code}',
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const progress = createTransferProgress('download', { total: expectedSize, log, intervalMs: progressIntervalMs });
+    child.stderr.on('data', chunk => progress.push(chunk));
     let status = '';
     child.stdout.on('data', bytes => { if (status.length < 100) status += bytes.toString(); });
     child.on('error', () => reject(error('ECURL')));
-    child.on('close', code => resolveResult({ code: Number.isInteger(code) ? code : -1, status: Number(status.trim()) || 0 }));
+    child.on('close', code => { progress.end(); resolveResult({ code: Number.isInteger(code) ? code : -1, status: Number(status.trim()) || 0 }); });
     child.stdin.on('error', () => {});
     child.stdin.end('url = "' + url.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"\n');
   });
@@ -65,7 +69,7 @@ export async function downloadSource({ url, output = 'input.ipa', expectedSize =
       // source content without a server-provided version/ETag guarantee.
       await rm(partial, { force: true });
       log(`Source download attempt ${attempt}/${attempts}; low-speed timeout 20s`);
-      const result = await transport(parsed.href, partial, { ...options, maxSeconds: Math.min(options.maxSeconds || 900, remaining) });
+      const result = await transport(parsed.href, partial, { ...options, expectedSize, log, maxSeconds: Math.min(options.maxSeconds || 900, remaining) });
       if (result.code === 0) {
         const size = (await stat(partial)).size;
         if (size <= 0 || (expectedSize && size !== expectedSize)) throw error('ESIZE');

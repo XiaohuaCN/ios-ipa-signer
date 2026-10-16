@@ -1,7 +1,50 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createTransport, uploadParts, uploadOssFile } from './upload-signed-ipa.mjs';
+import { createTransport, uploadParts, uploadOssFile, curlPut } from './upload-signed-ipa.mjs';
+import { parseCurlProgress, createTransferProgress } from './transfer-progress.mjs';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+test('progress parser accepts numeric meters only, using the correct transfer direction', () => {
+  const row = ' 50 4M 25 1M 50 2M 1M 2M 0:00:04 0:00:02 0:00:02 512k';
+  assert.equal(parseCurlProgress(row, 'upload').transferred, 2 * 1048576);
+  assert.equal(parseCurlProgress(row, 'download').transferred, 1048576);
+  for (const raw of ['curl: (22) private-url?Signature=private-token', '::warning::secret', 'Set-Cookie: secret',
+    row.replace('512k', 'https://secret.example'), row.replace('0:00:02', 'secret'), 'x'.repeat(2000) + row]) {
+    assert.equal(parseCurlProgress(raw, 'upload'), null);
+  }
+});
+test('progress output is throttled, handles split rows and never forwards raw diagnostics', () => {
+  const logs = []; let time = 0;
+  const progress = createTransferProgress('upload', { total: 4 * 1048576, log: s => logs.push(s), now: () => time });
+  const row = '50 4M 0 0 50 2M 0 1M 0:00:04 0:00:02 0:00:02 1M';
+  progress.push('curl: private-url?Signature=secret\n::warning::private-token\r');
+  progress.push(row.slice(0, 22)); progress.push(row.slice(22) + '\r');
+  time = 1000; progress.push(row + '\r'); assert.equal(logs.length, 1);
+  time = 5000; progress.push(row + '\r'); assert.equal(logs.length, 2);
+  progress.push('100 4M 0 0 100 4M 0 1M 0:00:04 0:00:04 --:--:-- 1M'); progress.end();
+  assert.equal(logs.length, 3); assert.match(logs[0], /^OSS upload: 50% \| 2.00\/4.00 MiB/);
+  assert.match(logs[2], /^OSS upload: 100%/); assert.ok(!logs.join('\n').includes('secret'));
+});
+test('real curl upload produces safe progress while stdout stays machine-readable', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ipa-upload-progress-'));
+  const file = join(dir, 'signed.ipa'), logs = [];
+  const bytes = Buffer.alloc(256 * 1024, 7); await writeFile(file, bytes);
+  let received = 0;
+  const server = http.createServer((req, res) => {
+    req.on('data', chunk => { received += chunk.length; });
+    req.on('end', () => setTimeout(() => res.end('ok'), 1200));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await curlPut({ file, url: 'http://127.0.0.1:' + server.address().port + '/private?Signature=secret',
+      deadlineMs: 10000, size: bytes.length, allowHttp: true, log: s => logs.push(s), progressIntervalMs: 0 });
+    assert.equal(result.status, 200); assert.equal(result.bytes, bytes.length); assert.equal(received, bytes.length);
+    assert.ok(logs.some(s => s.startsWith('OSS upload: 100%'))); assert.ok(!logs.join('\n').includes('Signature'));
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(dir, { recursive: true, force: true }); }
+});
 
 const session = {
   upload_id: 'local-session', chunk_size: 8, total_chunks: 3,
