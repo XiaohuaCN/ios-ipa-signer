@@ -144,7 +144,7 @@ export async function uploadOssFile({ file, size, ticket, getTicket, put = curlP
   if (!Number.isSafeInteger(size) || size <= 0) throw protocolError();
   const started = now();
   let attempt = 0;
-  log('Upload route: direct OSS; signed IPA bytes do not pass through Cloudflare or OpenList');
+  log('Upload route: direct OSS' + (new URL(ossTicket(ticket).upload).hostname.includes('.oss-accelerate.') ? ' (transfer acceleration)' : ' (regional endpoint)'));
   return withRetry(async () => {
     const remaining = budgetMs - (now() - started);
     if (remaining <= 0) throw Object.assign(new Error('Upload deadline exceeded'), { code: 'EUPLOADDEADLINE', retryable: false });

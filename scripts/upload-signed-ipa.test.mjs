@@ -25,7 +25,16 @@ test('OSS upload streams one file directly and retains the original public downl
   assert.equal(calls[0].file, 'signed.ipa');
   assert.equal(calls[0].url, oss.upload_url);
   assert.equal(result, oss.signed_ipa_url);
+  assert.equal(logs[0], 'Upload route: direct OSS (transfer acceleration)');
+  assert.ok(!logs[0].includes('OpenList'));
   assert.ok(!logs.filter(line => !line.startsWith('::add-mask::')).join('\n').includes('private-bucket'));
+});
+test('regional OSS route is identified without exposing storage addresses', async () => {
+  const ticket = { ...oss, upload_url: oss.upload_url.replace('.oss-accelerate.', '.oss-cn-hangzhou.') };
+  const logs = [];
+  await uploadOssFile({ file: 'signed.ipa', size: 512, ticket, log: line => logs.push(line),
+    getTicket: () => assert.fail('Unexpected refresh'), put: async () => ({ status: 200, bytes: 512 }) });
+  assert.equal(logs[0], 'Upload route: direct OSS (regional endpoint)');
 });
 test('expired OSS credentials refresh before retry; storage response contents stay private', async () => {
   let uploads = 0, refreshes = 0;
